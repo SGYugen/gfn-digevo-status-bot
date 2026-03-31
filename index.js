@@ -129,7 +129,7 @@ async function fetchDigevoSiteInfo() {
 
     const $ = cheerio.load(res.data);
 
-    // Heurística simple para oferta principal (ej: BLACK SALE, descuentos, CLP/COL/PE) [page:3]
+    // Heurística simple para oferta principal [page:3]
     const bodyText = $('body').text().toLowerCase();
 
     const hasMoney =
@@ -141,7 +141,6 @@ async function fetchDigevoSiteInfo() {
       bodyText.includes('oferta');
 
     if (hasMoney) {
-      // Intentar usar el bloque del slider principal
       const hero = $('body').text().trim().replace(/\s+/g, ' ');
       offerText = hero.slice(0, 200) + '...';
       offerUrl = 'https://geforcenow.digevo.com/';
@@ -208,11 +207,11 @@ async function buildEmbed() {
   else if (gfnLevel === 'issue') gfnStatusText = 'Incidencias activas';
   else gfnStatusText = 'Estado desconocido';
 
-  // Incidencias GFN: solo link cuando hay incidencia [page:2]
-  let gfnIncidenciasLine = 'Incidencias: Sin incidencias recientes reportadas';
-  if (incident.incidentText && incident.incidentUrl) {
-    gfnIncidenciasLine = `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`;
-  }
+  // Incidencias GFN: solo link cuando hay incidente [page:2]
+  const gfnIncidenciasLine =
+    incident.incidentText && incident.incidentUrl
+      ? `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`
+      : 'Incidencias: Sin incidencias recientes reportadas';
 
   // Nivel Digevo global [page:3]
   let digevoLevel = 'unknown';
@@ -227,7 +226,6 @@ async function buildEmbed() {
   else digevoStatusText = 'Estado desconocido';
 
   // Estado por servidor NPA-DIG-SCL-01 / NPA-DIG-BOG-01
-  // Heurística: usamos latamSouth para SCL y latamNorth para BOG
   const sclLevel = mapStatusToLevel(sclStatus, sclStatus);
   const bogLevel = mapStatusToLevel(bogStatus, bogStatus);
 
@@ -253,12 +251,11 @@ async function buildEmbed() {
     .setDescription('Panel automático de estado para GFN global y servidores Digevo (Chile/Colombia).')
     .addFields(
       {
-        // Campo 1: título + espacio + cuerpo
+        // Campo 1: título sin URL visible, cuerpo con texto linkeado solo si hay incidente
         name: 'ESTADO SERVIDORES GFN',
         value:
-          `[Ver status global](https://status.geforcenow.com)\n\n` +
-          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n` +
-          `${gfnIncidenciasLine}`,
+          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` +
+          gfnIncidenciasLine,
         inline: false
       },
       {
@@ -279,7 +276,7 @@ async function buildEmbed() {
     })
     .setColor(0x00aaff);
 
-  // Campo extra bajo condiciones (web Digevo) [page:3]
+  // Campo extra WEB DIGEVO solo si hay caída/oferta [page:3]
   if (digevoSite.siteLevel === 'issue' || digevoSite.offerText) {
     let extraLines = '';
 

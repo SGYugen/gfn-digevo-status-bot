@@ -8,10 +8,23 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
 const MESSAGE_ID = process.env.STATUS_MESSAGE_ID || null;
 
+const ROLE_SERVERS_DOWN = process.env.ROLE_SERVERS_DOWN || null;
+const ROLE_WEB_DOWN = process.env.ROLE_WEB_DOWN || null;
+const ROLE_WEB_OFFER = process.env.ROLE_WEB_OFFER || null;
+const ROLE_SERVERS_ISSUES = process.env.ROLE_SERVERS_ISSUES || null;
+
 console.log('Iniciando bot...');
 console.log('DISCORD_TOKEN presente:', !!TOKEN);
 console.log('STATUS_CHANNEL_ID:', CHANNEL_ID);
 console.log('STATUS_MESSAGE_ID:', MESSAGE_ID);
+
+// Estado previo para evitar spam
+let previousFlags = {
+  serversDown: false,
+  serversIssues: false,
+  webDown: false,
+  webOffer: false
+};
 
 // Cliente de Discord
 const client = new Client({
@@ -186,20 +199,18 @@ function levelToIcon(level) {
   return '⚪';
 }
 
-// Color del embed según estado global
 function getEmbedColor(globalLevel) {
-  // Verde GFN aproximado, naranja y rojo
-  if (globalLevel === 'ok') return 0x76b900;      // verde NVIDIA [page:3]
+  if (globalLevel === 'ok') return 0x76b900;      // verde NVIDIA
   if (globalLevel === 'degraded') return 0xffa500; // naranja
   if (globalLevel === 'issue') return 0xff0000;    // rojo
-  return 0x00aaff; // azul por defecto
+  return 0x00aaff;
 }
 
 // ------------------------
-// Construir embed
+// Construir embed + flags
 // ------------------------
 
-async function buildEmbed() {
+async function buildEmbedAndFlags() {
   const status = await fetchGfnStatus();
   const incident = await fetchGfnLatestIncident();
   const digevoSite = await fetchDigevoSiteInfo();
@@ -222,14 +233,12 @@ async function buildEmbed() {
       ? `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`
       : 'Incidencias: Sin incidencias recientes reportadas';
 
-  // Nivel global para color (GFN + Digevo)
   let globalLevel = 'unknown';
   const mallIsIssue = mallLevel === 'issue';
   if (gfnLevel === 'issue' || mallIsIssue) globalLevel = 'issue';
   else if (gfnLevel === 'degraded') globalLevel = 'degraded';
   else if (gfnLevel === 'ok' && mallLevel === 'ok') globalLevel = 'ok';
 
-  // Por servidor
   const sclLevel = mapSingleToLevel(sclStatus);
   const bogLevel = mapSingleToLevel(bogStatus);
 
@@ -254,19 +263,17 @@ async function buildEmbed() {
     .setDescription('Panel automático de estado para GFN global y servidores Digevo (Chile/Colombia).')
     .addFields(
       {
-        // Campo GFN: título con link en línea separada
         name: 'ESTADO SERVIDORES GFN',
         value:
-          `[Ver estado servidores](https://status.geforcenow.com)\n\n` + // [aquí espacio en blanco] antes del estado
-          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` + // [aquí espacio en blanco] antes de incidencias
+          `[Ver estado servidores](https://status.geforcenow.com)\n\n` +
+          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` +
           gfnIncidenciasLine,
         inline: false
       },
       {
-        // Campo Digevo: sin línea "Operativo" arriba
         name: 'ESTADO SERVIDORES DIGEVO',
         value:
-          `\n${sclLine}\n` + // [aquí espacio en blanco] antes de SCL, con guion
+          `\n${sclLine}\n` +
           `${bogLine}\n` +
           `${digevoIncidenciasText}`,
         inline: false
@@ -279,7 +286,6 @@ async function buildEmbed() {
     })
     .setColor(getEmbedColor(globalLevel));
 
-  // Campo WEB DIGEVO solo en dos condiciones [page:3]
   if (digevoSite.siteLevel === 'issue' || digevoSite.offerText) {
     let extraLines = '\n';
 
@@ -288,7 +294,7 @@ async function buildEmbed() {
     }
 
     if (digevoSite.offerText && digevoSite.offerUrl) {
-      extraLines += `[Oferta detectada](${digevoSite.offerUrl})`; // texto corto, link incrustado
+      extraLines += `[Oferta detectada](${digevoSite.offerUrl})`;
     }
 
     embed.addFields({
@@ -298,11 +304,19 @@ async function buildEmbed() {
     });
   }
 
-  return embed;
+  // Flags para pings
+  const flags = {
+    serversDown: globalLevel === 'issue',
+    serversIssues: globalLevel === 'degraded' || mallLevel === 'issue',
+    webDown: digevoSite.siteLevel === 'issue',
+    webOffer: !!digevoSite.offerText
+  };
+
+  return { embed, flags };
 }
 
 // ------------------------
-// Actualizar mensaje en Discord
+// Actualizar mensaje + pings
 // ------------------------
 
 async function updateStatusMessage() {
@@ -322,8 +336,32 @@ async function updateStatusMessage() {
       return;
     }
 
-    const embed = await buildEmbed();
+    const { embed, flags } = await buildEmbedAndFlags();
 
+    // Detectar cambios para pings
+    const messagesToSend = [];
+
+    if (flags.serversDown && !previousFlags.serversDown && ROLE_SERVERS_DOWN) {
+      messagesToSend.push(`<@&${ROLE_SERVERS_DOWN}> Servidores GFN/Digevo con caídas.`);
+    }
+    if (flags.serversIssues && !previousFlags.serversIssues && ROLE_SERVERS_ISSUES) {
+      messagesToSend.push(`<@&${ROLE_SERVERS_ISSUES}> Servidores con problemas de rendimiento (lag/errores).`);
+    }
+    if (flags.webDown && !previousFlags.webDown && ROLE_WEB_DOWN) {
+      messagesToSend.push(`<@&${ROLE_WEB_DOWN}> Problemas detectados con la web de Digevo.`);
+    }
+    if (flags.webOffer && !previousFlags.webOffer && ROLE_WEB_OFFER) {
+      messagesToSend.push(`<@&${ROLE_WEB_OFFER}> Nueva oferta detectada en la web de Digevo.`);
+    }
+
+    previousFlags = flags;
+
+    // Enviar pings (si hay)
+    for (const content of messagesToSend) {
+      await channel.send({ content });
+    }
+
+    // Editar o crear el mensaje de estado
     if (MESSAGE_ID) {
       const msg = await channel.messages.fetch(MESSAGE_ID).catch(() => null);
       if (msg) {

@@ -31,10 +31,13 @@ client.on('error', err => console.error('[CLIENT ERROR]', err));
 client.once('ready', () => {
   console.log(`Bot conectado como ${client.user.tag}`);
   updateStatusMessage();
-  setInterval(updateStatusMessage, 5 * 60 * 1000);
+  setInterval(updateStatusMessage, 5 * 60 * 1000); // cada 5 minutos
 });
 
-// Obtiene estado desde status.geforcenow.com y hace healthcheck al mall
+// ------------------------
+// Scrape de estados GFN/Digevo
+// ------------------------
+
 async function fetchGfnStatus() {
   let latamSouth = 'unknown';
   let latamNorth = 'unknown';
@@ -42,6 +45,7 @@ async function fetchGfnStatus() {
 
   console.log('fetchGfnStatus: iniciando...');
 
+  // Status oficial GFN (NVIDIA) [page:1]
   try {
     const res = await axios.get('https://status.geforcenow.com/');
     const $ = cheerio.load(res.data);
@@ -66,6 +70,7 @@ async function fetchGfnStatus() {
     latamNorth = 'error';
   }
 
+  // Healthcheck Mall Digevo [page:3]
   try {
     const mallRes = await axios.get('https://play.geforcenow.com/mall/', { timeout: 8000 });
     mallHealth = mallRes.status === 200 ? 'ok' : `http_${mallRes.status}`;
@@ -83,40 +88,134 @@ async function fetchGfnStatus() {
   };
 }
 
-function mapStatusToEmoji(text) {
-  const t = (text || '').toLowerCase();
-  if (t.includes('operational') || t.includes('available') || t === 'ok') return '✅';
-  if (t.includes('degraded') || t.includes('partial')) return '⚠️';
-  if (t.includes('major') || t.includes('outage') || t.includes('down') || t.includes('error')) return '🔴';
-  return '❓';
+// Historial de incidentes GFN (lo más reciente) [page:2]
+async function fetchGfnLatestIncident() {
+  let incidentText = 'Sin incidentes recientes reportados';
+  let incidentUrl = 'https://status.geforcenow.com/history';
+
+  try {
+    const res = await axios.get('https://status.geforcenow.com/history');
+    const $ = cheerio.load(res.data);
+
+    // Esto depende del HTML de statuspage; usamos un selector genérico
+    // Primer bloque de incidente
+    const firstIncident = $('.incident-title, .incidents-list .incident-container, .unresolved-incidents li').first();
+
+    if (firstIncident && firstIncident.length > 0) {
+      // Título simple
+      const text = firstIncident.text().trim().replace(/\s+/g, ' ');
+      if (text) {
+        incidentText = text;
+      }
+
+      // Si hay link interno, lo usamos; si no, dejamos el history genérico
+      const link = firstIncident.find('a').attr('href');
+      if (link) {
+        if (link.startsWith('http')) {
+          incidentUrl = link;
+        } else {
+          incidentUrl = 'https://status.geforcenow.com' + link;
+        }
+      }
+    }
+
+    console.log('fetchGfnLatestIncident:', incidentText, '->', incidentUrl);
+  } catch (e) {
+    console.error('Error leyendo history de GFN:', e.message);
+  }
+
+  return { incidentText, incidentUrl };
 }
 
-// Construir el embed de estado
+// ------------------------
+// Helpers de estado
+// ------------------------
+
+function mapStatusToLevel(latamSouth, latamNorth) {
+  const s = (latamSouth || '').toLowerCase();
+  const n = (latamNorth || '').toLowerCase();
+  const all = `${s} ${n}`;
+
+  if (all.includes('major') || all.includes('outage') || all.includes('partial')) return 'issue';
+  if (all.includes('degraded')) return 'degraded';
+  if (all.includes('operational') || all.includes('available')) return 'ok';
+  return 'unknown';
+}
+
+function mapMallToLevel(mallHealth) {
+  const m = (mallHealth || '').toLowerCase();
+  if (m === 'ok') return 'ok';
+  if (m.startsWith('http_5') || m === 'error') return 'issue';
+  return 'unknown';
+}
+
+function levelToIcon(level) {
+  if (level === 'ok') return '🟢';
+  if (level === 'degraded') return '🟡';
+  if (level === 'issue') return '🔴';
+  return '⚪';
+}
+
+// ------------------------
+// Construir embed
+// ------------------------
+
 async function buildEmbed() {
   const status = await fetchGfnStatus();
+  const incident = await fetchGfnLatestIncident();
 
   const sclStatus = status.latamSouth;
   const bogStatus = status.latamNorth;
+  const mallLevel = mapMallToLevel(status.mallHealth);
+  const gfnLevel = mapStatusToLevel(sclStatus, bogStatus);
 
   console.log('buildEmbed: sclStatus =', sclStatus, 'bogStatus =', bogStatus, 'mall =', status.mallHealth);
 
+  // Texto general para GFN
+  let gfnStatusText = '';
+  if (gfnLevel === 'ok') gfnStatusText = 'Operativo';
+  else if (gfnLevel === 'degraded') gfnStatusText = 'Degradado';
+  else if (gfnLevel === 'issue') gfnStatusText = 'Incidencias activas';
+  else gfnStatusText = 'Estado desconocido';
+
+  // Texto general para Digevo (usando mall + regiones) [page:3]
+  let digevoLevel = 'unknown';
+  if (gfnLevel === 'issue' || mallLevel === 'issue') digevoLevel = 'issue';
+  else if (gfnLevel === 'degraded') digevoLevel = 'degraded';
+  else if (gfnLevel === 'ok' && mallLevel === 'ok') digevoLevel = 'ok';
+
+  let digevoStatusText = '';
+  if (digevoLevel === 'ok') digevoStatusText = 'Operativo';
+  else if (digevoLevel === 'degraded') digevoStatusText = 'Degradado';
+  else if (digevoLevel === 'issue') digevoStatusText = 'Posibles incidencias / lag';
+  else digevoStatusText = 'Estado desconocido';
+
+  // Incidencias Digevo según healthcheck [page:3]
+  let digevoIncidentText = '';
+  if (mallLevel === 'ok') {
+    digevoIncidentText = 'Sin incidencias detectadas por el monitor';
+  } else if (mallLevel === 'issue') {
+    digevoIncidentText = 'Problemas al conectar con play.geforcenow.com/mall (posible lag/caída)';
+  } else {
+    digevoIncidentText = 'Información insuficiente (healthcheck no concluyente)';
+  }
+
   const embed = new EmbedBuilder()
-    .setTitle('Estado GeForce NOW by Digevo (LATAM)')
-    .setDescription('Panel automático de estado para Digevo (Chile/Colombia).')
+    .setTitle('Estado GeForce NOW (GFN & Digevo)')
+    .setDescription('Panel automático de estado para GFN global y servidores Digevo (Chile/Colombia).')
     .addFields(
       {
-        name: 'NPA-DIG-SCL-01 (Chile, RTX 4080)',
-        value: `${mapStatusToEmoji(sclStatus)} ${sclStatus}`,
+        name: '[ESTADO SERVIDORES GFN](https://status.geforcenow.com)',
+        value:
+          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n` +
+          `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`,
         inline: false
       },
       {
-        name: 'NPA-DIG-BOG-01 (Colombia, RTX 4080)',
-        value: `${mapStatusToEmoji(bogStatus)} ${bogStatus}`,
-        inline: false
-      },
-      {
-        name: 'Mall Digevo (play.geforcenow.com/mall)',
-        value: `${mapStatusToEmoji(status.mallHealth)} ${status.mallHealth}`,
+        name: 'ESTADO SERVIDORES DIGEVO',
+        value:
+          `${levelToIcon(digevoLevel)} ${digevoStatusText}\n` +
+          `Incidencias: ${digevoIncidentText}`,
         inline: false
       }
     )
@@ -130,7 +229,10 @@ async function buildEmbed() {
   return embed;
 }
 
-// Crear o actualizar el mensaje de estado en Discord
+// ------------------------
+// Actualizar mensaje en Discord
+// ------------------------
+
 async function updateStatusMessage() {
   try {
     console.log('updateStatusMessage: iniciando...');
@@ -177,9 +279,9 @@ if (!TOKEN) {
   });
 }
 
-// --- Servidor HTTP mínimo para Render ---
+// --- Servidor HTTP mínimo para Railway/Render ---
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.get('/', (_req, res) => {
   res.send('GFN Digevo status bot running');

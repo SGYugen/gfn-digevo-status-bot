@@ -8,6 +8,11 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
 const MESSAGE_ID = process.env.STATUS_MESSAGE_ID || null;
 
+console.log('Iniciando bot...');
+console.log('DISCORD_TOKEN presente:', !!TOKEN);
+console.log('STATUS_CHANNEL_ID:', CHANNEL_ID);
+console.log('STATUS_MESSAGE_ID:', MESSAGE_ID);
+
 // Cliente de Discord
 const client = new Client({
   intents: [
@@ -18,18 +23,29 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
+// Logs de eventos de Discord
+client.on('debug', msg => console.log('[DEBUG]', msg));
+client.on('warn', msg => console.warn('[WARN]', msg));
+client.on('error', err => console.error('[CLIENT ERROR]', err));
+
+client.once('ready', () => {
+  console.log(`Bot conectado como ${client.user.tag}`);
+  updateStatusMessage();
+  setInterval(updateStatusMessage, 5 * 60 * 1000);
+});
+
 // Obtiene estado desde status.geforcenow.com y hace healthcheck al mall
 async function fetchGfnStatus() {
   let latamSouth = 'unknown';
   let latamNorth = 'unknown';
   let mallHealth = 'unknown';
 
-  // Scrape de la página de status de NVIDIA
+  console.log('fetchGfnStatus: iniciando...');
+
   try {
     const res = await axios.get('https://status.geforcenow.com/');
     const $ = cheerio.load(res.data);
 
-    // Dependiendo del HTML, estos selectores pueden necesitar ajuste
     $('div.component-container, li.component-container').each((_, el) => {
       const name = $(el).text().trim();
       const statusEl = $(el).find('.component-status, .status, .component-statuses');
@@ -42,16 +58,18 @@ async function fetchGfnStatus() {
         latamNorth = statusText || 'unknown';
       }
     });
+
+    console.log('fetchGfnStatus: latamSouth =', latamSouth, 'latamNorth =', latamNorth);
   } catch (e) {
     console.error('Error leyendo status.geforcenow.com:', e.message);
     latamSouth = 'error';
     latamNorth = 'error';
   }
 
-  // Healthcheck del Mall
   try {
     const mallRes = await axios.get('https://play.geforcenow.com/mall/', { timeout: 8000 });
     mallHealth = mallRes.status === 200 ? 'ok' : `http_${mallRes.status}`;
+    console.log('fetchGfnStatus: mallHealth =', mallHealth);
   } catch (e) {
     console.error('Error healthcheck mall:', e.message);
     mallHealth = 'error';
@@ -65,7 +83,6 @@ async function fetchGfnStatus() {
   };
 }
 
-// Mapear texto de estado a emoji
 function mapStatusToEmoji(text) {
   const t = (text || '').toLowerCase();
   if (t.includes('operational') || t.includes('available') || t === 'ok') return '✅';
@@ -80,6 +97,8 @@ async function buildEmbed() {
 
   const sclStatus = status.latamSouth;
   const bogStatus = status.latamNorth;
+
+  console.log('buildEmbed: sclStatus =', sclStatus, 'bogStatus =', bogStatus, 'mall =', status.mallHealth);
 
   const embed = new EmbedBuilder()
     .setTitle('Estado GeForce NOW by Digevo (LATAM)')
@@ -114,12 +133,16 @@ async function buildEmbed() {
 // Crear o actualizar el mensaje de estado en Discord
 async function updateStatusMessage() {
   try {
+    console.log('updateStatusMessage: iniciando...');
     if (!CHANNEL_ID) {
       console.error('Falta STATUS_CHANNEL_ID');
       return;
     }
 
-    const channel = await client.channels.fetch(CHANNEL_ID);
+    const channel = await client.channels.fetch(CHANNEL_ID).catch(err => {
+      console.error('Error al buscar canal:', err.message);
+      return null;
+    });
     if (!channel) {
       console.error('No se encontró el canal');
       return;
@@ -145,17 +168,14 @@ async function updateStatusMessage() {
   }
 }
 
-// Evento ready del bot
-client.once('ready', () => {
-  console.log(`Bot conectado como ${client.user.tag}`);
-  // Primera actualización inmediata
-  updateStatusMessage();
-  // Actualizar cada 5 minutos
-  setInterval(updateStatusMessage, 5 * 60 * 1000);
-});
-
 // Login del bot
-client.login(TOKEN);
+if (!TOKEN) {
+  console.error('No hay DISCORD_TOKEN, abortando login');
+} else {
+  client.login(TOKEN).catch(err => {
+    console.error('Error en client.login:', err);
+  });
+}
 
 // --- Servidor HTTP mínimo para Render ---
 const app = express();

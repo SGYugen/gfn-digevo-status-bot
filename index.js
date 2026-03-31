@@ -186,6 +186,15 @@ function levelToIcon(level) {
   return '⚪';
 }
 
+// Color del embed según estado global
+function getEmbedColor(globalLevel) {
+  // Verde GFN aproximado, naranja y rojo
+  if (globalLevel === 'ok') return 0x76b900;      // verde NVIDIA [page:3]
+  if (globalLevel === 'degraded') return 0xffa500; // naranja
+  if (globalLevel === 'issue') return 0xff0000;    // rojo
+  return 0x00aaff; // azul por defecto
+}
+
 // ------------------------
 // Construir embed
 // ------------------------
@@ -213,16 +222,12 @@ async function buildEmbed() {
       ? `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`
       : 'Incidencias: Sin incidencias recientes reportadas';
 
-  let digevoLevel = 'unknown';
-  if (gfnLevel === 'issue' || mallLevel === 'issue') digevoLevel = 'issue';
-  else if (gfnLevel === 'degraded') digevoLevel = 'degraded';
-  else if (gfnLevel === 'ok' && mallLevel === 'ok') digevoLevel = 'ok';
-
-  let digevoStatusText = '';
-  if (digevoLevel === 'ok') digevoStatusText = 'Operativo';
-  else if (digevoLevel === 'degraded') digevoStatusText = 'Degradado';
-  else if (digevoLevel === 'issue') digevoStatusText = 'Posibles incidencias / lag';
-  else digevoStatusText = 'Estado desconocido';
+  // Nivel global para color (GFN + Digevo)
+  let globalLevel = 'unknown';
+  const mallIsIssue = mallLevel === 'issue';
+  if (gfnLevel === 'issue' || mallIsIssue) globalLevel = 'issue';
+  else if (gfnLevel === 'degraded') globalLevel = 'degraded';
+  else if (gfnLevel === 'ok' && mallLevel === 'ok') globalLevel = 'ok';
 
   // Por servidor
   const sclLevel = mapSingleToLevel(sclStatus);
@@ -231,8 +236,8 @@ async function buildEmbed() {
   const sclIssueWord = sclLevel === 'issue' ? 'CAÍDA ' : sclLevel === 'degraded' ? 'LAG ' : '';
   const bogIssueWord = bogLevel === 'issue' ? 'CAÍDA ' : bogLevel === 'degraded' ? 'LAG ' : '';
 
-  const sclLine = `NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
-  const bogLine = `NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
+  const sclLine = `- NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
+  const bogLine = `- NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
 
   let digevoIncidenciasText = '';
   if (mallLevel === 'ok') {
@@ -249,18 +254,19 @@ async function buildEmbed() {
     .setDescription('Panel automático de estado para GFN global y servidores Digevo (Chile/Colombia).')
     .addFields(
       {
-        // Campo GFN: título clicable y cuerpo como pediste
-        name: '[ESTADO SERVIDORES GFN](https://status.geforcenow.com)',
+        // Campo GFN: título con link en línea separada
+        name: 'ESTADO SERVIDORES GFN',
         value:
-          `\n${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` +
+          `[Ver estado servidores](https://status.geforcenow.com)\n\n` + // [aquí espacio en blanco] antes del estado
+          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` + // [aquí espacio en blanco] antes de incidencias
           gfnIncidenciasLine,
         inline: false
       },
       {
-        // Campo Digevo: sin línea "Operativo" aparte
+        // Campo Digevo: sin línea "Operativo" arriba
         name: 'ESTADO SERVIDORES DIGEVO',
         value:
-          `\n${sclLine}\n` +
+          `\n${sclLine}\n` + // [aquí espacio en blanco] antes de SCL, con guion
           `${bogLine}\n` +
           `${digevoIncidenciasText}`,
         inline: false
@@ -271,7 +277,7 @@ async function buildEmbed() {
         timeZone: 'America/Santiago'
       })}`
     })
-    .setColor(0x00aaff);
+    .setColor(getEmbedColor(globalLevel));
 
   // Campo WEB DIGEVO solo en dos condiciones [page:3]
   if (digevoSite.siteLevel === 'issue' || digevoSite.offerText) {
@@ -282,7 +288,7 @@ async function buildEmbed() {
     }
 
     if (digevoSite.offerText && digevoSite.offerUrl) {
-      extraLines += `[Oferta detectada](${digevoSite.offerUrl})`;
+      extraLines += `[Oferta detectada](${digevoSite.offerUrl})`; // texto corto, link incrustado
     }
 
     embed.addFields({

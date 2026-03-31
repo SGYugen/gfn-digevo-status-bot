@@ -44,7 +44,6 @@ async function fetchGfnStatus() {
 
   console.log('fetchGfnStatus: iniciando...');
 
-  // Status oficial GFN [page:1]
   try {
     const res = await axios.get('https://status.geforcenow.com/');
     const $ = cheerio.load(res.data);
@@ -65,7 +64,6 @@ async function fetchGfnStatus() {
     latamNorth = 'error';
   }
 
-  // Healthcheck Mall [page:3]
   try {
     const mallRes = await axios.get('https://play.geforcenow.com/mall/', { timeout: 8000 });
     mallHealth = mallRes.status === 200 ? 'ok' : `http_${mallRes.status}`;
@@ -83,7 +81,6 @@ async function fetchGfnStatus() {
   };
 }
 
-// Incidente más reciente de GFN [page:2]
 async function fetchGfnLatestIncident() {
   let incidentText = null;
   let incidentUrl = null;
@@ -117,9 +114,8 @@ async function fetchGfnLatestIncident() {
   return { incidentText, incidentUrl };
 }
 
-// Info de la web de Digevo (caída / oferta) [page:3]
 async function fetchDigevoSiteInfo() {
-  let siteLevel = 'ok'; // ok / issue / unknown
+  let siteLevel = 'ok';
   let offerText = null;
   let offerUrl = null;
 
@@ -128,11 +124,9 @@ async function fetchDigevoSiteInfo() {
     if (res.status !== 200) siteLevel = 'issue';
 
     const $ = cheerio.load(res.data);
-
-    // Heurística simple para oferta principal [page:3]
     const bodyText = $('body').text().toLowerCase();
 
-    const hasMoney =
+    const hasOffer =
       bodyText.includes('$') ||
       bodyText.includes('clp') ||
       bodyText.includes('col') ||
@@ -140,13 +134,12 @@ async function fetchDigevoSiteInfo() {
       bodyText.includes('descuento') ||
       bodyText.includes('oferta');
 
-    if (hasMoney) {
-      const hero = $('body').text().trim().replace(/\s+/g, ' ');
-      offerText = hero.slice(0, 200) + '...';
+    if (hasOffer) {
+      offerText = 'Oferta detectada';
       offerUrl = 'https://geforcenow.digevo.com/';
     }
 
-    console.log('fetchDigevoSiteInfo: siteLevel =', siteLevel, 'offerText =', offerText ? 'sí' : 'no');
+    console.log('fetchDigevoSiteInfo: siteLevel =', siteLevel, 'offer =', !!offerText);
   } catch (e) {
     console.error('Error accediendo a geforcenow.digevo.com:', e.message);
     siteLevel = 'issue';
@@ -167,6 +160,15 @@ function mapStatusToLevel(latamSouth, latamNorth) {
   if (all.includes('major') || all.includes('outage') || all.includes('partial')) return 'issue';
   if (all.includes('degraded')) return 'degraded';
   if (all.includes('operational') || all.includes('available')) return 'ok';
+  return 'unknown';
+}
+
+function mapSingleToLevel(text) {
+  const t = (text || '').toLowerCase();
+  if (t.includes('major') || t.includes('outage') || t.includes('partial')) return 'issue';
+  if (t.includes('degraded')) return 'degraded';
+  if (t.includes('operational') || t.includes('available')) return 'ok';
+  if (t === 'error') return 'issue';
   return 'unknown';
 }
 
@@ -200,20 +202,17 @@ async function buildEmbed() {
 
   console.log('buildEmbed: sclStatus =', sclStatus, 'bogStatus =', bogStatus, 'mall =', status.mallHealth);
 
-  // Texto general GFN
   let gfnStatusText = '';
   if (gfnLevel === 'ok') gfnStatusText = 'Operativo';
   else if (gfnLevel === 'degraded') gfnStatusText = 'Degradado';
   else if (gfnLevel === 'issue') gfnStatusText = 'Incidencias activas';
   else gfnStatusText = 'Estado desconocido';
 
-  // Incidencias GFN: solo link cuando hay incidente [page:2]
   const gfnIncidenciasLine =
     incident.incidentText && incident.incidentUrl
       ? `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`
       : 'Incidencias: Sin incidencias recientes reportadas';
 
-  // Nivel Digevo global [page:3]
   let digevoLevel = 'unknown';
   if (gfnLevel === 'issue' || mallLevel === 'issue') digevoLevel = 'issue';
   else if (gfnLevel === 'degraded') digevoLevel = 'degraded';
@@ -225,17 +224,16 @@ async function buildEmbed() {
   else if (digevoLevel === 'issue') digevoStatusText = 'Posibles incidencias / lag';
   else digevoStatusText = 'Estado desconocido';
 
-  // Estado por servidor NPA-DIG-SCL-01 / NPA-DIG-BOG-01
-  const sclLevel = mapStatusToLevel(sclStatus, sclStatus);
-  const bogLevel = mapStatusToLevel(bogStatus, bogStatus);
+  // Por servidor
+  const sclLevel = mapSingleToLevel(sclStatus);
+  const bogLevel = mapSingleToLevel(bogStatus);
 
   const sclIssueWord = sclLevel === 'issue' ? 'CAÍDA ' : sclLevel === 'degraded' ? 'LAG ' : '';
   const bogIssueWord = bogLevel === 'issue' ? 'CAÍDA ' : bogLevel === 'degraded' ? 'LAG ' : '';
 
-  const sclLine = `- NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
-  const bogLine = `- NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
+  const sclLine = `NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
+  const bogLine = `NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
 
-  // Incidencias Digevo según mall [page:3]
   let digevoIncidenciasText = '';
   if (mallLevel === 'ok') {
     digevoIncidenciasText = 'Incidencias: Sin incidencias detectadas por el monitor';
@@ -251,19 +249,18 @@ async function buildEmbed() {
     .setDescription('Panel automático de estado para GFN global y servidores Digevo (Chile/Colombia).')
     .addFields(
       {
-        // Campo 1: título sin URL visible, cuerpo con texto linkeado solo si hay incidente
-        name: 'ESTADO SERVIDORES GFN',
+        // Campo GFN: título clicable y cuerpo como pediste
+        name: '[ESTADO SERVIDORES GFN](https://status.geforcenow.com)',
         value:
-          `${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` +
+          `\n${levelToIcon(gfnLevel)} ${gfnStatusText}\n\n` +
           gfnIncidenciasLine,
         inline: false
       },
       {
-        // Campo 2: título + espacio + cuerpo
+        // Campo Digevo: sin línea "Operativo" aparte
         name: 'ESTADO SERVIDORES DIGEVO',
         value:
-          `${levelToIcon(digevoLevel)} ${digevoStatusText}\n` +
-          `${sclLine}\n` +
+          `\n${sclLine}\n` +
           `${bogLine}\n` +
           `${digevoIncidenciasText}`,
         inline: false
@@ -276,21 +273,21 @@ async function buildEmbed() {
     })
     .setColor(0x00aaff);
 
-  // Campo extra WEB DIGEVO solo si hay caída/oferta [page:3]
+  // Campo WEB DIGEVO solo en dos condiciones [page:3]
   if (digevoSite.siteLevel === 'issue' || digevoSite.offerText) {
-    let extraLines = '';
+    let extraLines = '\n';
 
     if (digevoSite.siteLevel === 'issue') {
       extraLines += '⚠️ Problemas detectados con la web de Digevo (posible caída o error).\n';
     }
 
-    if (digevoSite.offerText) {
-      extraLines += `🎁 Oferta detectada: [${digevoSite.offerText}](${digevoSite.offerUrl})`;
+    if (digevoSite.offerText && digevoSite.offerUrl) {
+      extraLines += `[Oferta detectada](${digevoSite.offerUrl})`;
     }
 
     embed.addFields({
       name: 'WEB DIGEVO',
-      value: extraLines || 'Sin novedades relevantes en la web',
+      value: extraLines.trim(),
       inline: false
     });
   }
@@ -348,7 +345,7 @@ if (!TOKEN) {
   });
 }
 
-// --- Servidor HTTP mínimo para host ---
+// HTTP mínimo
 const app = express();
 const PORT = process.env.PORT || 8080;
 

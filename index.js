@@ -165,15 +165,17 @@ async function fetchDigevoSiteInfo() {
 }
 
 // ------------------------
-// POP / serverInfo (GFN Digevo)
+// POP / serverInfo (GFN Digevo) + latencia
 // ------------------------
 
 async function fetchPopInfo() {
+  const start = Date.now();
   try {
     const res = await axios.get(
       'https://prod.dig.geforcenow.nvidiagrid.net/v2/serverInfo',
       { timeout: 8000 }
     );
+    const latencyMs = Date.now() - start;
 
     const data = res.data || {};
 
@@ -205,7 +207,9 @@ async function fetchPopInfo() {
       'statusCode =',
       statusCode,
       'statusDescription =',
-      statusDescription
+      statusDescription,
+      'latencyMs =',
+      latencyMs
     );
 
     return {
@@ -213,9 +217,11 @@ async function fetchPopInfo() {
       region,
       serverId,
       statusCode,
-      statusDescription
+      statusDescription,
+      latencyMs
     };
   } catch (e) {
+    const latencyMs = Date.now() - start;
     console.error('Error llamando a serverInfo (POP):', e.message);
     return {
       ok: false,
@@ -223,9 +229,33 @@ async function fetchPopInfo() {
       serverId: null,
       statusCode: null,
       statusDescription: null,
+      latencyMs,
       error: e.message
     };
   }
+}
+
+// Clasificación más fina del estado POP
+function classifyPop(popInfo) {
+  if (!popInfo) return 'unknown';
+
+  // No respuesta válida o error HTTP
+  if (popInfo.statusCode === null && !popInfo.ok) {
+    return 'down';
+  }
+
+  // Respuesta con error interno explícito
+  if (!popInfo.ok && popInfo.statusCode !== null) {
+    return 'maintenance'; // mantenimiento o fallo interno probable
+  }
+
+  // ok == true (SUCCESS_STATUS)
+  if (popInfo.latencyMs == null) return 'ok';
+
+  if (popInfo.latencyMs > 8000) return 'down';  // timeout práctico
+  if (popInfo.latencyMs > 500) return 'lag';    // >500ms = lag probable
+
+  return 'ok';
 }
 
 // ------------------------
@@ -305,21 +335,27 @@ async function buildEmbedAndFlags() {
   let sclLevel = mapSingleToLevel(sclStatus);
   let bogLevel = mapSingleToLevel(bogStatus);
 
-  // Ajustes internos según serverInfo (POP)
-  // Chile: esperamos SCL (LATAM West)
+  // Clasificación POP basada en serverInfo + latencia
+  let sclStatusType = 'unknown';
+  let bogStatusType = 'unknown';
+
   if (popInfo && popInfo.serverId === 'NPA-DIG-SCL-01') {
-    if (!popInfo.ok) {
-      // Si serverInfo dice que SCL no está OK, forzamos "issue" para SCL
-      sclLevel = 'issue';
-    }
+    sclStatusType = classifyPop(popInfo);
+  }
+  if (popInfo && popInfo.serverId === 'NPA-DIG-BOG-01') {
+    bogStatusType = classifyPop(popInfo);
   }
 
-  // Colombia: esperamos BOG (LATAM North)
-  if (popInfo && popInfo.serverId === 'NPA-DIG-BOG-01') {
-    if (!popInfo.ok) {
-      bogLevel = 'issue';
-    }
+  // Aplicar tipos POP (down / lag / maintenance) a niveles
+  function applyPopTypeToLevel(level, type) {
+    if (type === 'down') return 'issue';            // caída → rojo
+    if (type === 'maintenance') return 'degraded'; // mantenimiento probable → naranja (warning)
+    if (type === 'lag') return 'degraded';         // lag probable → naranja (warning)
+    return level; // ok / unknown → se mantiene lo que diga status.geforcenow.com
   }
+
+  sclLevel = applyPopTypeToLevel(sclLevel, sclStatusType);
+  bogLevel = applyPopTypeToLevel(bogLevel, bogStatusType);
 
   // Recalcular globalLevel con los niveles ajustados
   let globalLevel = 'unknown';
@@ -331,13 +367,18 @@ async function buildEmbedAndFlags() {
   else if (anyDegraded) globalLevel = 'degraded';
   else if (sclLevel === 'ok' && bogLevel === 'ok' && mallLevel === 'ok') globalLevel = 'ok';
 
-  const sclIssueWord = sclLevel === 'issue' ? 'CAÍDA ' : sclLevel === 'degraded' ? 'LAG ' : '';
-  const bogIssueWord = bogLevel === 'issue' ? 'CAÍDA ' : bogLevel === 'degraded' ? 'LAG ' : '';
+  const sclIssueWord =
+    sclLevel === 'issue' ? 'CAÍDA ' :
+    sclLevel === 'degraded' ? 'LAG ' : '';
+
+  const bogIssueWord =
+    bogLevel === 'issue' ? 'CAÍDA ' :
+    bogLevel === 'degraded' ? 'LAG ' : '';
 
   const sclLine = `- NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
   const bogLine = `- NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
 
-  // Texto de incidencias para DIGEVO según niveles
+  // Texto de incidencias para DIGEVO según tipos y niveles
   let digevoIncidenciasText = '';
 
   const sclProblem = sclLevel === 'issue' || sclLevel === 'degraded';

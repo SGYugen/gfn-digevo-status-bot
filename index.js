@@ -1,16 +1,18 @@
+require('dotenv').config();
+
 const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 
-// Variables de entorno
+// Variables de entorno (desde .env)
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
 const MESSAGE_ID = process.env.STATUS_MESSAGE_ID || null;
 
-const ROLE_SERVERS_DOWN = process.env.ROLE_SERVERS_DOWN || null;
-const ROLE_WEB_DOWN = process.env.ROLE_WEB_DOWN || null;
-const ROLE_WEB_OFFER = process.env.ROLE_WEB_OFFER || null;
+const ROLE_SERVERS_DOWN   = process.env.ROLE_SERVERS_DOWN   || null;
+const ROLE_WEB_DOWN       = process.env.ROLE_WEB_DOWN       || null;
+const ROLE_WEB_OFFER      = process.env.ROLE_WEB_OFFER      || null;
 const ROLE_SERVERS_ISSUES = process.env.ROLE_SERVERS_ISSUES || null;
 
 console.log('Iniciando bot...');
@@ -18,13 +20,14 @@ console.log('DISCORD_TOKEN presente:', !!TOKEN);
 console.log('STATUS_CHANNEL_ID:', CHANNEL_ID);
 console.log('STATUS_MESSAGE_ID:', MESSAGE_ID);
 
-// Estado previo para evitar spam
+// Estado previo para pings
 let previousFlags = {
   serversDown: false,
   serversIssues: false,
   webDown: false,
   webOffer: false
 };
+let hasPreviousFlags = false; // clave: indica si ya hubo al menos un ciclo completo
 
 // Cliente de Discord
 const client = new Client({
@@ -162,6 +165,70 @@ async function fetchDigevoSiteInfo() {
 }
 
 // ------------------------
+// POP / serverInfo (GFN Digevo)
+// ------------------------
+
+async function fetchPopInfo() {
+  try {
+    const res = await axios.get(
+      'https://prod.dig.geforcenow.nvidiagrid.net/v2/serverInfo',
+      { timeout: 8000 }
+    );
+
+    const data = res.data || {};
+
+    const requestStatus = data.requestStatus || {};
+    const metaData = Array.isArray(data.metaData) ? data.metaData : [];
+
+    const serverId = requestStatus.serverId || null;
+    const statusCode = requestStatus.statusCode ?? null;
+    const statusDescription = requestStatus.statusDescription || null;
+
+    let region = null;
+    for (const item of metaData) {
+      if (item && item.key === 'local-region') {
+        region = item.value;
+        break;
+      }
+    }
+
+    const ok = statusCode === 1 && statusDescription === 'SUCCESS_STATUS';
+
+    console.log(
+      'fetchPopInfo:',
+      'ok =',
+      ok,
+      'region =',
+      region,
+      'serverId =',
+      serverId,
+      'statusCode =',
+      statusCode,
+      'statusDescription =',
+      statusDescription
+    );
+
+    return {
+      ok,
+      region,
+      serverId,
+      statusCode,
+      statusDescription
+    };
+  } catch (e) {
+    console.error('Error llamando a serverInfo (POP):', e.message);
+    return {
+      ok: false,
+      region: null,
+      serverId: null,
+      statusCode: null,
+      statusDescription: null,
+      error: e.message
+    };
+  }
+}
+
+// ------------------------
 // Helpers
 // ------------------------
 
@@ -214,6 +281,7 @@ async function buildEmbedAndFlags() {
   const status = await fetchGfnStatus();
   const incident = await fetchGfnLatestIncident();
   const digevoSite = await fetchDigevoSiteInfo();
+  const popInfo = await fetchPopInfo();
 
   const sclStatus = status.latamSouth;
   const bogStatus = status.latamNorth;
@@ -233,14 +301,35 @@ async function buildEmbedAndFlags() {
       ? `Incidencias: [${incident.incidentText}](${incident.incidentUrl})`
       : 'Incidencias: Sin incidencias recientes reportadas';
 
+  // Niveles base desde status.geforcenow.com
+  let sclLevel = mapSingleToLevel(sclStatus);
+  let bogLevel = mapSingleToLevel(bogStatus);
+
+  // Ajustes internos según serverInfo (POP)
+  // Chile: esperamos SCL (LATAM West)
+  if (popInfo && popInfo.serverId === 'NPA-DIG-SCL-01') {
+    if (!popInfo.ok) {
+      // Si serverInfo dice que SCL no está OK, forzamos "issue" para SCL
+      sclLevel = 'issue';
+    }
+  }
+
+  // Colombia: esperamos BOG (LATAM North)
+  if (popInfo && popInfo.serverId === 'NPA-DIG-BOG-01') {
+    if (!popInfo.ok) {
+      bogLevel = 'issue';
+    }
+  }
+
+  // Recalcular globalLevel con los niveles ajustados
   let globalLevel = 'unknown';
   const mallIsIssue = mallLevel === 'issue';
-  if (gfnLevel === 'issue' || mallIsIssue) globalLevel = 'issue';
-  else if (gfnLevel === 'degraded') globalLevel = 'degraded';
-  else if (gfnLevel === 'ok' && mallLevel === 'ok') globalLevel = 'ok';
+  const anyIssue = sclLevel === 'issue' || bogLevel === 'issue';
+  const anyDegraded = sclLevel === 'degraded' || bogLevel === 'degraded';
 
-  const sclLevel = mapSingleToLevel(sclStatus);
-  const bogLevel = mapSingleToLevel(bogStatus);
+  if (anyIssue || mallIsIssue) globalLevel = 'issue';
+  else if (anyDegraded) globalLevel = 'degraded';
+  else if (sclLevel === 'ok' && bogLevel === 'ok' && mallLevel === 'ok') globalLevel = 'ok';
 
   const sclIssueWord = sclLevel === 'issue' ? 'CAÍDA ' : sclLevel === 'degraded' ? 'LAG ' : '';
   const bogIssueWord = bogLevel === 'issue' ? 'CAÍDA ' : bogLevel === 'degraded' ? 'LAG ' : '';
@@ -248,14 +337,32 @@ async function buildEmbedAndFlags() {
   const sclLine = `- NPA-DIG-SCL-01 ${sclIssueWord}${levelToIcon(sclLevel)}`;
   const bogLine = `- NPA-DIG-BOG-01 ${bogIssueWord}${levelToIcon(bogLevel)}`;
 
+  // Texto de incidencias para DIGEVO según niveles
   let digevoIncidenciasText = '';
-  if (mallLevel === 'ok') {
+
+  const sclProblem = sclLevel === 'issue' || sclLevel === 'degraded';
+  const bogProblem = bogLevel === 'issue' || bogLevel === 'degraded';
+
+  if (!sclProblem && !bogProblem && mallLevel === 'ok') {
     digevoIncidenciasText = 'Incidencias: Sin incidencias detectadas por el monitor';
-  } else if (mallLevel === 'issue') {
-    digevoIncidenciasText =
-      'Incidencias: Problemas al conectar con play.geforcenow.com/mall (posible lag/caída)';
   } else {
-    digevoIncidenciasText = 'Incidencias: Información insuficiente (healthcheck no concluyente)';
+    const afectados = [];
+    if (sclProblem) afectados.push('SCL');
+    if (bogProblem) afectados.push('BOG');
+
+    if (afectados.length === 1) {
+      digevoIncidenciasText =
+        `Incidencias: Posibles fallas o interrupciones en el servidor ${afectados[0]}`;
+    } else if (afectados.length === 2) {
+      digevoIncidenciasText =
+        'Incidencias: Posibles fallas o interrupciones en los servidores SCL y BOG';
+    } else if (mallLevel === 'issue') {
+      digevoIncidenciasText =
+        'Incidencias: Problemas al conectar con play.geforcenow.com/mall (posible lag/caída)';
+    } else {
+      digevoIncidenciasText =
+        'Incidencias: Información insuficiente (healthcheck no concluyente)';
+    }
   }
 
   const embed = new EmbedBuilder()
@@ -304,7 +411,6 @@ async function buildEmbedAndFlags() {
     });
   }
 
-  // Flags para pings
   const flags = {
     serversDown: globalLevel === 'issue',
     serversIssues: globalLevel === 'degraded' || mallLevel === 'issue',
@@ -338,30 +444,32 @@ async function updateStatusMessage() {
 
     const { embed, flags } = await buildEmbedAndFlags();
 
-    // Detectar cambios para pings
     const messagesToSend = [];
 
-    if (flags.serversDown && !previousFlags.serversDown && ROLE_SERVERS_DOWN) {
-      messagesToSend.push(`<@&${ROLE_SERVERS_DOWN}> Servidores GFN/Digevo con caídas.`);
-    }
-    if (flags.serversIssues && !previousFlags.serversIssues && ROLE_SERVERS_ISSUES) {
-      messagesToSend.push(`<@&${ROLE_SERVERS_ISSUES}> Servidores con problemas de rendimiento (lag/errores).`);
-    }
-    if (flags.webDown && !previousFlags.webDown && ROLE_WEB_DOWN) {
-      messagesToSend.push(`<@&${ROLE_WEB_DOWN}> Problemas detectados con la web de Digevo.`);
-    }
-    if (flags.webOffer && !previousFlags.webOffer && ROLE_WEB_OFFER) {
-      messagesToSend.push(`<@&${ROLE_WEB_OFFER}> Nueva oferta detectada en la web de Digevo.`);
+    // Solo ping si NO es el primer ciclo (hasPreviousFlags true)
+    if (hasPreviousFlags) {
+      if (flags.serversDown && !previousFlags.serversDown && ROLE_SERVERS_DOWN) {
+        messagesToSend.push(`<@&${ROLE_SERVERS_DOWN}> Servidores GFN/Digevo con caídas.`);
+      }
+      if (flags.serversIssues && !previousFlags.serversIssues && ROLE_SERVERS_ISSUES) {
+        messagesToSend.push(`<@&${ROLE_SERVERS_ISSUES}> Servidores con problemas de rendimiento (lag/errores).`);
+      }
+      if (flags.webDown && !previousFlags.webDown && ROLE_WEB_DOWN) {
+        messagesToSend.push(`<@&${ROLE_WEB_DOWN}> Problemas detectados con la web de Digevo.`);
+      }
+      if (flags.webOffer && !previousFlags.webOffer && ROLE_WEB_OFFER) {
+        messagesToSend.push(`<@&${ROLE_WEB_OFFER}> Nueva oferta detectada en la web de Digevo.`);
+      }
     }
 
+    // Actualizar estado previo y marcar que ya hubo al menos un ciclo
     previousFlags = flags;
+    hasPreviousFlags = true;
 
-    // Enviar pings (si hay)
     for (const content of messagesToSend) {
       await channel.send({ content });
     }
 
-    // Editar o crear el mensaje de estado
     if (MESSAGE_ID) {
       const msg = await channel.messages.fetch(MESSAGE_ID).catch(() => null);
       if (msg) {
